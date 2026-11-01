@@ -14,6 +14,10 @@ on:
         description: 'Optional exact 40-character source commit; empty means this workflow commit'
         type: string
         default: ''
+      windows_only:
+        description: Build only the existing Windows x64 and ARM64 candidate job
+        type: boolean
+        default: false
       app_build:
         description: 'Optional numeric macOS candidate build number; does not publish updates'
         type: string
@@ -31,6 +35,9 @@ on:
       source_sha:
         type: string
         default: ''
+      windows_only:
+        type: boolean
+        default: false
       app_build:
         type: string
         default: ''
@@ -86,6 +93,7 @@ jobs:
           fi
 
   macos:
+    if: ${{ !inputs.windows_only }}
     needs: [source, agent-speed-sync]
     runs-on: macos-26
     timeout-minutes: 50
@@ -201,14 +209,22 @@ jobs:
 
   summary:
     needs: [source, macos, windows]
+    if: ${{ always() && !cancelled() && needs.source.result == 'success' && needs.windows.result == 'success' && (needs.macos.result == 'success' || (inputs.windows_only && needs.macos.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     steps:
       - name: Candidate handoff
+        env:
+          WINDOWS_ONLY: ${{ inputs.windows_only }}
         run: |
           {
             echo '## Cloud-built candidate — not a public release'
             echo 'Source commit: `${{ needs.source.outputs.sha }}`'
-            echo 'Download the candidate-macos / candidate-windows artifacts from this run.'
-            echo 'macOS is ad-hoc signed. Automatic-update signatures are intentionally absent until protected signing is configured.'
+            if [[ "$WINDOWS_ONLY" == "true" ]]; then
+              echo 'Download the candidate-windows artifact from this run.'
+              echo 'Automatic-update signatures are intentionally absent until protected signing is configured.'
+            else
+              echo 'Download the candidate-macos / candidate-windows artifacts from this run.'
+              echo 'macOS is ad-hoc signed. Automatic-update signatures are intentionally absent until protected signing is configured.'
+            fi
             echo 'No tag, public Release, updater feed change, or local application installation was performed.'
           } >> "$GITHUB_STEP_SUMMARY"
