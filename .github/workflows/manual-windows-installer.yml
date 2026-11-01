@@ -1,0 +1,117 @@
+name: Manual Windows x64 installer
+run-name: Windows x64 installer from ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit to build (includes the listen fix)
+        required: true
+        type: string
+        default: '436db080ae47664cf0c67a1e676978d2e7febb00'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-windows-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: '1.93.1'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '3'
+      CARGO_INCREMENTAL: '0'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source
+        env:
+          REQUESTED_SHA: ${{ inputs.source_sha }}
+        run: |
+          if ($env:REQUESTED_SHA -notmatch '^[0-9a-f]{40}$') { throw 'An exact source SHA is required' }
+          if ((git rev-parse HEAD).Trim() -ne $env:REQUESTED_SHA) { throw 'Source checkout does not match requested commit' }
+          git status --short
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tauri-app/package-lock.json
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.303'
+      - name: Install locked frontend dependencies
+        working-directory: tauri-app
+        run: |
+          npm ci --registry=https://registry.npmjs.org --ignore-scripts --no-audit --no-fund --maxsockets=1 --fetch-retries=0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify client event regression
+        working-directory: tauri-app
+        run: |
+          node --test src/multiClient/sharedChoiceEvents.test.mjs src/multiClient/homepagePerformance.test.mjs src/quota-sidebar/harnessDashboardPolish.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build complete Windows x64 installer
+        run: |
+          . ./scripts/cloud/prepare-windows.ps1
+          $version = (Get-Content tauri-app/package.json -Raw | ConvertFrom-Json).version
+          ./scripts/build_tauri_windows_release.ps1 -Version $version -Arch x64 -SkipNpmCi -ReuseCargoTestCache 2>&1 | Tee-Object windows-build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:BUILT_VERSION = $version
+          "BUILT_VERSION=$version" | Add-Content $env:GITHUB_ENV
+      - name: Prepare verified download
+        run: |
+          $version = $env:BUILT_VERSION
+          $buildDir = "dist/release/v$version/windows-build"
+          node scripts/tauri_windows_release_helper.mjs validate-build "$buildDir/build-manifest.json" $buildDir $version "$env:RUNNER_TEMP/validated-assets.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory windows-installer | Out-Null
+          Copy-Item "$buildDir/*" windows-installer/
+          $provenance = [ordered]@{
+            sourceCommit = (git rev-parse HEAD).Trim()
+            repository = $env:GITHUB_REPOSITORY
+            runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            version = $version
+            architecture = 'x64'
+            localListenFix = $true
+            updaterSigned = $false
+            authenticodeSigned = $false
+            rust = (rustc --version)
+            dotnet = (dotnet --version)
+          }
+          $provenance | ConvertTo-Json -Depth 5 | Set-Content windows-installer/provenance.json -Encoding utf8NoBOM
+          (git rev-parse HEAD).Trim() | Set-Content windows-installer/SOURCE-COMMIT.txt -Encoding utf8NoBOM
+          $lines = Get-ChildItem windows-installer -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $lines | Set-Content windows-installer/SHA256SUMS.txt -Encoding utf8NoBOM
+          "## Windows x64 installer ready" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "Source: ``$((git rev-parse HEAD).Trim())``" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "Download the windows-x64-installer artifact below. This build is unsigned; it does not publish a release or install anything." | Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: Upload installer and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-x64-installer-${{ github.run_id }}
+          path: windows-installer/*
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-build-log-${{ github.run_id }}
+          path: windows-build.log
+          retention-days: 3
+          if-no-files-found: ignore
