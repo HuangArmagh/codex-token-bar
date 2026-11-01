@@ -1,0 +1,113 @@
+name: Manual cache reminder diagnostic
+run-name: Diagnose the existing cache reminder Windows test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: '1.93.1'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_BUILD_JOBS: '3'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare Windows toolchain
+        run: |
+          . ./scripts/cloud/prepare-windows.ps1
+          "$env:PATH" | Set-Content "$env:RUNNER_TEMP/native-path.txt"
+          Get-ChildItem Env: | Where-Object Name -in @('INCLUDE', 'LIB', 'LIBPATH', 'VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion') | ForEach-Object {
+            "$($_.Name)=$($_.Value)" | Add-Content $env:GITHUB_ENV
+          }
+          "$env:PATH" | Add-Content $env:GITHUB_PATH
+      - name: Compare unchanged Rust sources and reproduce poll expiry
+        run: |
+          @'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          root = pathlib.Path.cwd()
+          output = root / 'hosted-diagnostics'
+          output.mkdir(exist_ok=True)
+          base = 'f17cdb252e03b72ac76c0b7d077f02fa888c3b92'
+          head = '436db080ae47664cf0c67a1e676978d2e7febb00'
+          tracker_path = 'tauri-app/src-tauri/src/core/live_rate/cache_reminder.rs'
+          test_path = 'tauri-app/src-tauri/src/core/live_rate_tests.rs'
+          test_name = 'core::live_rate::live_rate_tests::cache_advice_same_length_rollout_rewrite_resets_the_reminder'
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          blobs = {}
+          for path in [tracker_path, test_path, 'tauri-app/src-tauri/src/core/live_rate/rollout.rs']:
+              blobs[path] = {sha: git('rev-parse', f'{sha}:{path}') for sha in [base, head]}
+              assert blobs[path][base] == blobs[path][head], path
+          changed = git('diff', '--name-only', base, head).splitlines()
+          assert sorted(changed) == sorted([
+              'tauri-app/src/multiClient/useClientScope.ts',
+              'tauri-app/src/multiClient/sharedChoiceEvents.test.mjs',
+          ]), changed
+
+          results = []
+          for label, sha in [('upstream', base), ('pr5', head)]:
+              subprocess.run(['git', 'checkout', '--detach', sha], check=True)
+              tracker = (root / tracker_path).read_text(encoding='utf-8')
+              anchor = '    pub(super) fn begin_poll(&mut self, now: f64, monotonic: Instant) {\n'
+              assert tracker.count(anchor) == 1
+              tracker = tracker.replace(anchor, anchor + '        eprintln!("CACHE_DIAGNOSTIC poll gap={:?} now={} not_before={}", self.last_poll.map(|last| monotonic.duration_since(last)), now, self.not_before);\n')
+              anchor = '        if matches!(&observation, CacheObservation::Sample(sample) if sample.timestamp.is_some_and(|at| at < self.not_before))\n'
+              assert tracker.count(anchor) == 1
+              tracker = tracker.replace(anchor, '        eprintln!("CACHE_DIAGNOSTIC observation={:?} now={} not_before={}", observation, now, self.not_before);\n' + anchor)
+              (root / tracker_path).write_text(tracker, encoding='utf-8')
+
+              test = (root / test_path).read_text(encoding='utf-8')
+              anchor = '    let scope = LiveRateSourceScope::new(root.display().to_string(), "cache-rewrite");'
+              start = test.index(anchor)
+              anchor = '    read_snapshot_result_at(&root, &scope, None, now - 1.0).unwrap();\n'
+              at = test.index(anchor, start) + len(anchor)
+              test = test[:at] + '    if let Ok(delay) = std::env::var("CTB_DIAGNOSTIC_DELAY_MS") {\n        std::thread::sleep(Duration::from_millis(delay.parse().unwrap()));\n    }\n' + test[at:]
+              (root / test_path).write_text(test, encoding='utf-8')
+
+              for delay in ['0', '6000']:
+                  case = f'{label}-delay-{delay}'
+                  env = dict(os.environ, CTB_DIAGNOSTIC_DELAY_MS=delay)
+                  command = ['cargo', 'test', '--locked', '--manifest-path', 'tauri-app/src-tauri/Cargo.toml', '--lib', test_name, '--', '--exact', '--nocapture', '--test-threads=1']
+                  print(f'::group::{case}', flush=True)
+                  result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+                  (output / f'{case}.log').write_text(result.stdout, encoding='utf-8')
+                  print(result.stdout[-18000:], flush=True)
+                  print('::endgroup::', flush=True)
+                  results.append({'case': case, 'source': sha, 'delayMs': int(delay), 'exitCode': result.returncode})
+                  if delay == '6000':
+                      assert result.returncode != 0 and 'before_rewrite.cache_advice' in result.stdout, case
+                      assert 'not_before=1784073600.5' in result.stdout, case
+              subprocess.run(['git', 'restore', '--', tracker_path, test_path], check=True)
+
+          report = {'base': base, 'head': head, 'changedFiles': changed, 'rustBlobs': blobs, 'results': results}
+          (output / 'results.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          print(json.dumps(report, indent=2), flush=True)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload synthetic diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cache-reminder-diagnostic-${{ github.run_id }}
+          path: hosted-diagnostics/*
+          retention-days: 3
+          if-no-files-found: warn
